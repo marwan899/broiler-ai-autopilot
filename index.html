@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Broiler Guide — Eng Marwan Alnasray</title>
+    <meta name="color-scheme" content="light">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      body { background:#f8fafc; color:#0f172a; }
+      .input { width:100%; border-radius:0.75rem; border:1px solid #cbd5e1; background:#fff; padding:0.5rem 0.75rem; outline:none; }
+      .input:focus { box-shadow:0 0 0 2px rgba(16,185,129,0.5); }
+      .bubble-user{ background:#e2fbe8; border:1px solid #bbf7d0; }
+      .bubble-ai{ background:#f1f5f9; border:1px solid #e2e8f0; }
+      .chip{ display:inline-flex; align-items:center; gap:.4rem; padding:.2rem .5rem; background:#ecfeff; color:#155e75; border-radius:.6rem; border:1px solid #a5f3fc; font-size:.75rem; font-weight:700; }
+      .th{ text-align:right; padding:0.75rem; font-weight:600; }
+      .td{ padding:0.5rem; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript><div style="padding:1rem;color:#b91c1c">هذه الصفحة تتطلب تشغيل JavaScript</div></noscript>
+
+    <script type="text/babel" data-presets="env,react">
+      const { useState, useMemo, useEffect, useRef } = React;
+
+      // ---------- Error Boundary ----------
+      class ErrorBoundary extends React.Component {
+        constructor(p){ super(p); this.state={hasError:false, error:null}; }
+        static getDerivedStateFromError(e){ return {hasError:true, error:e}; }
+        componentDidCatch(e,i){ console.error('App error:', e, i); }
+        render(){
+          if (this.state.hasError){
+            return (
+              <div className="max-w-xl mx-auto mt-8 p-4 rounded-xl bg-amber-50 border border-amber-200">
+                <h2 className="font-bold mb-2">حدث خطأ غير متوقع</h2>
+                <p className="text-sm text-slate-700">حدّث الصفحة أو أعد النشر. التفاصيل في Console.</p>
+              </div>
+            );
+          }
+          return this.props.children;
+        }
+      }
+
+      // ---------- Helpers ----------
+      function interpLinear(x, points, key){
+        if (!points || points.length === 0) return 0;
+        const sorted = points.slice().sort((a,b)=>a.d-b.d);
+        if (x <= sorted[0].d) return sorted[0][key];
+        if (x >= sorted[sorted.length-1].d) return sorted[sorted.length-1][key];
+        for (let i=0;i<sorted.length-1;i++){
+          const a=sorted[i], b=sorted[i+1];
+          if (x >= a.d && x <= b.d){
+            const t=(x-a.d)/Math.max(1e-9,(b.d-a.d));
+            return a[key]+t*(b[key]-a[key]);
+          }
+        }
+        return sorted[sorted.length-1][key];
+      }
+      function dailyFeedFromCurve(age, points){
+        const a = Math.max(1, Number(age)||1);
+        const fPrev = interpLinear(Math.max(1, a-1), points, 'f');
+        const fNow  = interpLinear(a, points, 'f');
+        return Math.max(0, fNow - fPrev);
+      }
+      function envTargetsForAge(age){
+        const ptsT=[{d:1,t:33},{d:7,t:30},{d:14,t:27},{d:21,t:24},{d:28,t:22},{d:35,t:21},{d:42,t:20}];
+        const ptsH=[{d:1,h:60},{d:7,h:60},{d:14,h:60},{d:21,h:60},{d:28,h:60},{d:35,h:60},{d:42,h:60}];
+        return { temp: interpLinear(age, ptsT, 't'), rh: interpLinear(age, ptsH, 'h') };
+      }
+      function calcWaterToFeed(tempC){
+        const base = 1.7, delta = tempC - 21;
+        const adj = delta>0 ? base + 0.03*Math.min(10, delta) : base + 0.02*delta;
+        return Math.max(1.2, Math.min(2.6, adj));
+      }
+
+      // ---------- Chat Panel ----------
+      function readFileAsDataURL(file){
+        return new Promise((res,rej)=>{ const fr=new FileReader(); fr.onload=()=>res(fr.result); fr.onerror=rej; fr.readAsDataURL(file); });
+      }
+      async function compressImageDataURL(dataURL, maxDim=1400, quality=0.86){
+        return new Promise(resolve=>{
+          const img=new Image();
+          img.onload=()=>{
+            const s=Math.min(1, maxDim/Math.max(img.width,img.height));
+            const c=document.createElement('canvas');
+            c.width=Math.round(img.width*s); c.height=Math.round(img.height*s);
+            c.getContext('2d').drawImage(img,0,0,c.width,c.height);
+            resolve(c.toDataURL('image/jpeg', quality));
+          };
+          img.onerror=()=>resolve(dataURL);
+          img.src=dataURL;
+        });
+      }
+
+      function Stat({label,value}){ return <div className="rounded-xl bg-slate-50 border border-slate-200 p-3"><p className="text-xs text-slate-500">{label}</p><p className="text-lg font-extrabold">{value}</p></div>; }
+      function Labeled({label, children}){ return <label className="block space-y-1"><span className="text-sm font-semibold text-slate-700">{label}</span>{children}</label>; }
+
+      function ChatPanel(){
+        const [messages, setMessages] = useState([]);
+        const [input, setInput] = useState('');
+        const [files, setFiles] = useState([]);
+        const [busy, setBusy] = useState(false);
+        const scrollRef = useRef(null);
+        useEffect(()=>{ if(scrollRef.current){ scrollRef.current.scrollTop=scrollRef.current.scrollHeight; }},[messages,busy]);
+        function onFileChange(e){ setFiles(Array.from(e.target.files||[])); }
+        async function sendMessage(){
+          const text = input.trim();
+          if(!text && files.length===0) return;
+          setBusy(true);
+          try{
+            const images=[];
+            for (const f of files){
+              const raw=await readFileAsDataURL(f);
+              const comp=await compressImageDataURL(raw,1400,0.86);
+              images.push(comp);
+            }
+            const r=await fetch('/api/ai-chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,images})});
+            const ok=r.ok; const data=await r.json().catch(()=>({error:'no json'}));
+            if(!ok) throw new Error((data && (data.error||data.detail)) || ('HTTP '+r.status));
+            setMessages(m=>m.concat([{role:'user',content:text,images},{role:'assistant',content:data.answer}]));
+            setInput(''); setFiles([]);
+          }catch(err){ alert('تعذر الإرسال: '+err.message); }finally{ setBusy(false); }
+        }
+        return (
+          <div className="rounded-2xl bg-white border border-slate-200 p-4 shadow-sm">
+            <h3 className="font-extrabold text-slate-800 mb-3">استشارة الذكاء الاصطناعي (مباشرة)</h3>
+            <div ref={scrollRef} className="h-72 overflow-auto rounded-xl border border-slate-200 bg-white p-3 space-y-3 mb-3">
+              {messages.length===0 && <div className="text-sm text-slate-500">اكتب مشكلتك وارفع صور إن وجدت، ثم اضغط إرسال.</div>}
+              {messages.map((m,i)=> <div key={i} className={'p-3 rounded-2xl border '+(m.role==='user'?'bubble-user':'bubble-ai')}>
+                <p className="whitespace-pre-wrap leading-7">{m.content}</p>
+                {m.images && m.images.length>0 && <div className="flex gap-2 mt-2 flex-wrap">{m.images.map((src,idx)=><img key={idx} src={src} className="h-24 w-24 object-cover rounded-lg border" />)}</div>}
+              </div>)}
+              {busy && <div className="text-sm text-slate-500">جارٍ الإرسال…</div>}
+            </div>
+            <div className="grid md:grid-cols-6 gap-2 items-start">
+              <div className="md:col-span-5">
+                <textarea rows="3" className="input" placeholder="وصف المشكلة (العمر، العدد، الحرارة، أعراض…)" value={input} onChange={e=>setInput(e.target.value)} />
+                <div className="flex items-center justify-between mt-2">
+                  <input type="file" accept="image/*" multiple onChange={onFileChange} />
+                  <div className="text-xs text-slate-500">{files.length>0? files.length+' صورة جاهزة':'اختياري: ارفع صور'}</div>
+                </div>
+              </div>
+              <div className="md:col-span-1">
+                <button onClick={sendMessage} className="px-4 py-2 rounded-xl text-white font-semibold bg-emerald-600 hover:bg-emerald-700 w-full">إرسال</button>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      function App(){
+        const [active, setActive] = useState('home');
+        const [aiMode, setAiMode] = useState(true);
+        const [age, setAge] = useState(21);
+        const [birds, setBirds] = useState(1000);
+        const [avgWeight, setAvgWeight] = useState(1.1);
+        const [feedConsumed, setFeedConsumed] = useState(1.85);
+        const [mortality, setMortality] = useState(2);
+        const [tempC, setTempC] = useState(28);
+        const [rh, setRh] = useState(60);
+        const [envOverride, setEnvOverride] = useState(false);
+        const [chickStartKg, setChickStartKg] = useState(0.046);
+
+        const standardsInit=[
+          { d:1, w:0.046, f:0.012 },{ d:7, w:0.175, f:0.19 },{ d:14, w:0.44, f:0.49 },
+          { d:21, w:0.86, f:0.9 },{ d:28, w:1.35, f:1.42 },{ d:35, w:1.94, f:2.05 },{ d:42, w:2.55, f:2.7 }
+        ];
+        const [standards, setStandards] = useState(standardsInit);
+
+        const aiAvgWeight = useMemo(()=>interpLinear(age, standards, 'w'),[age, standards]);
+        const aiCumFeed   = useMemo(()=>interpLinear(age, standards, 'f'),[age, standards]);
+        const aiDailyFeedPerBirdKg = useMemo(()=>dailyFeedFromCurve(age, standards),[age, standards]);
+        const envAuto     = useMemo(()=>envTargetsForAge(age),[age]);
+        const effectiveTemp = (aiMode && !envOverride)? envAuto.temp : tempC;
+        const effectiveRh   = (aiMode && !envOverride)? envAuto.rh   : rh;
+        const alive = useMemo(()=>Math.max(0, Math.round(birds*(1 - mortality/100))),[birds,mortality]);
+        const usedAvgW = useMemo(()=> aiMode? aiAvgWeight : avgWeight, [aiMode, aiAvgWeight, avgWeight]);
+        const usedCumF = useMemo(()=> aiMode? aiCumFeed   : feedConsumed, [aiMode, aiCumFeed, feedConsumed]);
+        const gainKg = useMemo(()=>Math.max(0, usedAvgW - (chickStartKg||0)),[usedAvgW,chickStartKg]);
+        const fcrGain = useMemo(()=> gainKg>0? (usedCumF/gainKg):0, [usedCumF,gainKg]);
+        const totalLiveWeightKg = useMemo(()=> usedAvgW*alive, [usedAvgW,alive]);
+        const totalFeedKg       = useMemo(()=> usedCumF*alive, [usedCumF,alive]);
+        const waterToFeedRatio  = useMemo(()=> calcWaterToFeed(effectiveTemp), [effectiveTemp]);
+        const feedTodayPerBirdKg= useMemo(()=> Math.max(0, aiDailyFeedPerBirdKg), [aiDailyFeedPerBirdKg]);
+
+        function updateStandard(i, key, val){
+          setStandards(prev => prev.map((row, idx)=> idx===i ? {...row, [key]: val} : row));
+        }
+
+        function NavButton({id, label}){
+          return <button onClick={()=>setActive(id)} className={'px-3 py-2 rounded-xl text-sm font-semibold hover:bg-slate-100 '+(active===id?'bg-slate-900 text-white hover:bg-slate-900':'')}>{label}</button>;
+        }
+
+        return (
+          <div className="min-h-screen">
+            <header className="sticky top-0 z-50 backdrop-blur bg-white/80 border-b border-slate-200">
+              <div className="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="w-9 h-9 rounded-2xl bg-emerald-600/90 grid place-items-center text-white font-bold">🐥</div>
+                  <h1 className="text-lg md:text-xl font-extrabold tracking-tight">دليل تربية فروج اللحم</h1>
+                  <span className="chip">من تطوير Eng Marwan Alnasray</span>
+                </div>
+                <nav className="flex flex-wrap gap-2">
+                  <NavButton id="home" label="الرئيسية" />
+                  <NavButton id="calc" label="الحاسبات" />
+                  <NavButton id="growth" label="المعايير" />
+                  <NavButton id="log" label="سجل يومي" />
+                  <NavButton id="consult" label="استشارة الذكاء الاصطناعي" />
+                  <NavButton id="about" label="عن الدليل" />
+                </nav>
+              </div>
+            </header>
+
+            <main className="max-w-6xl mx-auto px-4 py-6 space-y-6">
+              {active==='home' && (
+                <section className="space-y-6">
+                  <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-emerald-600 via-emerald-500 to-teal-500 text-white p-6 md:p-10 shadow-lg">
+                    <div className="max-w-2xl space-y-2">
+                      <p className="text-emerald-100 text-sm">استشارة مدمجة — تعمل مع باقي النظام</p>
+                      <h2 className="text-2xl md:text-4xl font-extrabold leading-tight">إدارة ذكية لقطيع فروج اللحم — حسابات دقيقة وتوصيات ذكية</h2>
+                      <p className="text-emerald-50/95">FCR على الزيادة، استهلاك علف/ماء، توصيات بيئية حسب العمر، واستشارة AI مدمجة.</p>
+                    </div>
+                    <div className="absolute -right-20 -bottom-20 w-64 h-64 md:w-96 md:h-96 rounded-full bg-white/10 blur-2xl"></div>
+                  </div>
+
+                  <div className="rounded-2xl bg-white border border-slate-200 p-4 shadow-sm">
+                    <div className="grid sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-7 gap-3">
+                      <Stat label="FCR (على الزيادة)" value={fcrGain.toFixed(2)} />
+                      <Stat label="أحياء" value={alive.toLocaleString()} />
+                      <Stat label="العمر (يوم)" value={age} />
+                      <Stat label="الوزن المتوقع/طير (كغم)" value={usedAvgW.toFixed(2)} />
+                      <Stat label="علف/طير اليوم (غم)" value={Math.round(feedTodayPerBirdKg*1000).toString()} />
+                      <Stat label="وزن حي (كغم)" value={totalLiveWeightKg.toFixed(1)} />
+                      <Stat label="علف (كغم)" value={totalFeedKg.toFixed(1)} />
+                    </div>
+                  </div>
+
+                  <div className="rounded-2xl bg-white border border-slate-200 p-4 shadow-sm">
+                    <h3 className="font-extrabold text-slate-800 mb-3">استشارة سريعة</h3>
+                    <ChatPanel />
+                  </div>
+                </section>
+              )}
+
+              {active==='calc' && (
+                <section className="grid md:grid-cols-2 gap-4">
+                  <div className='rounded-2xl bg-white border border-slate-200 p-4 shadow-sm'>
+                    <h3 className='font-extrabold text-slate-800 mb-3'>ملخص القطيع</h3>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Labeled label='عدد الطيور'><input type='number' className='input' value={birds} onChange={e=>setBirds(+e.target.value||0)} /></Labeled>
+                      <Labeled label='العمر (يوم)'><input type='number' className='input' value={age} onChange={e=>setAge(+e.target.value||0)} /></Labeled>
+                      <Labeled label='وزن الاستقبال (كغم/فرخ)'><input type='number' step='0.001' className='input' value={chickStartKg} onChange={e=>setChickStartKg(+e.target.value||0)} /></Labeled>
+                    </div>
+                    <div className='grid grid-cols-2 gap-3 mt-4'>
+                      <Stat label='FCR (Gain)' value={fcrGain.toFixed(2)} />
+                      <Stat label='أحياء' value={alive.toLocaleString()} />
+                      <Stat label='وزن حي/طير (كغم)' value={usedAvgW.toFixed(2)} />
+                      <Stat label='علف تراكمي/طير (كغم)' value={usedCumF.toFixed(2)} />
+                    </div>
+                  </div>
+
+                  <div className='rounded-2xl bg-white border border-slate-200 p-4 shadow-sm'>
+                    <h3 className='font-extrabold text-slate-800 mb-3'>البيئة (حسب العمر مع AI)</h3>
+                    <div className="flex items-center justify-between mb-2">
+                      <span className='text-sm text-slate-600'>{(!aiMode)?'وضع يدوي':'وضع AI — يعتمد العمر'} </span>
+                      {aiMode && <button onClick={()=>setEnvOverride(v=>!v)} className={'px-3 py-1 rounded-xl text-xs border ' + (envOverride?'bg-white':'bg-emerald-600 text-white border-emerald-600')}>{envOverride?'قفل التعديل اليدوي':'تعديل يدوي'}</button>}
+                    </div>
+                    <div className='grid grid-cols-2 gap-3'>
+                      <Labeled label='درجة الحرارة °C'>
+                        <input className='input' type='number' value={(aiMode && !envOverride)? envTargetsForAge(age).temp : tempC} onChange={e=>setTempC(+e.target.value||0)} disabled={aiMode && !envOverride} />
+                      </Labeled>
+                      <Labeled label='الرطوبة %'>
+                        <input className='input' type='number' value={(aiMode && !envOverride)? envTargetsForAge(age).rh : rh} onChange={e=>setRh(+e.target.value||0)} disabled={aiMode && !envOverride} />
+                      </Labeled>
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {active==='growth' && (
+                <section className='space-y-4'>
+                  <div className='rounded-2xl bg-white border border-slate-200 p-4 shadow-sm'>
+                    <h3 className='font-extrabold text-slate-800 mb-3'>معايير نمو تقريبية (قابلة للتعديل)</h3>
+                    <div className='overflow-x-auto'>
+                      <table className='w-full text-sm'>
+                        <thead><tr className='bg-slate-100'><th className='th'>العمر</th><th className='th'>الوزن</th><th className='th'>العلف</th></tr></thead>
+                        <tbody>
+                          {standards.map((r,i)=> (
+                            <tr key={i} className='border-b'>
+                              <td className='td'><input className='input' style={{width:'6rem'}} type='number' value={r.d} onChange={e=>updateStandard(i,'d',+e.target.value||0)} /></td>
+                              <td className='td'><input className='input' style={{width:'7rem'}} type='number' step='0.01' value={r.w} onChange={e=>updateStandard(i,'w',+e.target.value||0)} /></td>
+                              <td className='td'><input className='input' style={{width:'8rem'}} type='number' step='0.01' value={r.f} onChange={e=>updateStandard(i,'f',+e.target.value||0)} /></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </section>
+              )}
+
+              {active==='log' && (
+                <section className='space-y-4'>
+                  <div className='rounded-2xl bg-white border border-slate-200 p-4 shadow-sm'>
+                    <h3 className='font-extrabold text-slate-800 mb-3'>سجل يومي مبسّط</h3>
+                    <p className='text-sm text-slate-600'>إضافة لاحقًا: حفظ قراءات اليوم (علف، ماء، حرارة، نفوق) وإظهار رسومات بسيطة.</p>
+                  </div>
+                </section>
+              )}
+
+              {active==='consult' && (
+                <section className='space-y-4'>
+                  <div className='rounded-3xl bg-gradient-to-br from-emerald-600 via-emerald-500 to-teal-500 text-white p-6 md:p-10 shadow-lg'>
+                    <p className='text-emerald-100 text-sm'>الاستشارة مدمجة داخل التطبيق</p>
+                    <h2 className='text-2xl md:text-4xl font-extrabold leading-tight'>ارفع الصور واكتب مشكلتك</h2>
+                  </div>
+                  <ChatPanel />
+                </section>
+              )}
+
+              {active==='about' && (
+                <section className='space-y-4'>
+                  <div className='rounded-2xl bg-white border border-slate-200 p-4 shadow-sm'>
+                    <p className='leading-8 text-slate-700'>نظام إدارة شامل لمربي الدواجن مع حسابات دقيقة وتوصيات ذكية.</p>
+                    <div className='flex flex-wrap gap-2 text-sm text-slate-600'>
+                      <span className='px-2 py-1 rounded-lg bg-slate-100'>الإصدار: v1.3.5 — Gain-only</span>
+                      <a href='mailto:marwanshalan88@gmail.com' className='px-2 py-1 rounded-lg bg-slate-100 hover:underline'>marwanshalan88@gmail.com</a>
+                      <span className='px-2 py-1 rounded-lg bg-emerald-50 text-emerald-800'>من تطوير Eng Marwan Alnasray</span>
+                    </div>
+                  </div>
+                </section>
+              )}
+            </main>
+
+            <footer className="border-t border-slate-200 py-6 text-center text-sm text-slate-500">
+              © <span id="year"></span> Broiler Guide — من تطوير Eng Marwan Alnasray
+            </footer>
+          </div>
+        );
+      }
+
+      function Root(){ return <ErrorBoundary><App/></ErrorBoundary>; }
+      const root = ReactDOM.createRoot(document.getElementById('root'));
+      root.render(<Root/>);
+      document.getElementById('year').textContent = new Date().getFullYear();
+    </script>
+  </body>
+</html>
